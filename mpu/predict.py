@@ -133,9 +133,10 @@ def predict_file(input_csv_path, weights_path, output_csv_path):
         if c not in df.columns:
             raise ValueError(f"Required column '{c}' not found in {input_csv_path}")
     
-    # Handle N/A values in speed column
+    # Handle N/A values in speed column - fill with 0.0
     if df['speed'].dtype == 'object':
-        df['speed'] = pd.to_numeric(df['speed'], errors='coerce').fillna(0.0)
+        df['speed'] = pd.to_numeric(df['speed'], errors='coerce')
+    df['speed'] = df['speed'].fillna(0.0)
     
     # Remove empty rows
     df = df.dropna(subset=['acc_x', 'acc_y', 'acc_z'])
@@ -185,7 +186,7 @@ def predict_file(input_csv_path, weights_path, output_csv_path):
 
         if inferred_units is not None and inferred_units != lstm_units:
             print(f'Rebuilding with lstm_units={inferred_units} based on weights error parsing...')
-            # Optionally refine dense size from weights for this units
+            # Optionally refine dense sizes from weights for this units
             try:
                 # re-infer dense sizes using new lstm_units
                 _lstm_units, _n_classes, _dense_intermediate = infer_model_config_from_weights(weights_path)
