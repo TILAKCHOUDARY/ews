@@ -139,6 +139,14 @@ def predict_file(input_csv_path, weights_path, output_csv_path):
     
     # Remove empty rows
     df = df.dropna(subset=['acc_x', 'acc_y', 'acc_z'])
+    
+    # Remove rows where all sensor values are zero
+    df = df[~((df['acc_x'] == 0) & (df['acc_y'] == 0) & (df['acc_z'] == 0) & 
+              (df['gyro_x'] == 0) & (df['gyro_y'] == 0) & (df['gyro_z'] == 0))]
+    
+    print(f'Data shape after cleaning: {df.shape}')
+    print(f'Speed column info: dtype={df["speed"].dtype}, null_count={df["speed"].isnull().sum()}')
+    print(f'First 5 speed values: {df["speed"].head().tolist()}')
 
     X, indices = window_data(df)
     print('Windows:', X.shape)
