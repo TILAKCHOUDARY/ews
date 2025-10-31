@@ -111,11 +111,34 @@ def window_data(df, n_time_steps=104, step=104):
 def predict_file(input_csv_path, weights_path, output_csv_path):
     df = pd.read_csv(input_csv_path)
 
+    # Map column names if needed (handle both naming conventions)
+    column_mapping = {
+        'ax_g': 'acc_x',
+        'ay_g': 'acc_y',
+        'az_g': 'acc_z',
+        'gx_dps': 'gyro_x',
+        'gy_dps': 'gyro_y',
+        'gz_dps': 'gyro_z',
+        'gps_speed_kn': 'speed'
+    }
+    
+    # Rename columns if they exist
+    for old_name, new_name in column_mapping.items():
+        if old_name in df.columns:
+            df.rename(columns={old_name: new_name}, inplace=True)
+    
     # Check required columns
     required = ['acc_x','acc_y','acc_z','gyro_x','gyro_y','gyro_z','speed']
     for c in required:
         if c not in df.columns:
             raise ValueError(f"Required column '{c}' not found in {input_csv_path}")
+    
+    # Handle N/A values in speed column
+    if df['speed'].dtype == 'object':
+        df['speed'] = pd.to_numeric(df['speed'], errors='coerce').fillna(0.0)
+    
+    # Remove empty rows
+    df = df.dropna(subset=['acc_x', 'acc_y', 'acc_z'])
 
     X, indices = window_data(df)
     print('Windows:', X.shape)
