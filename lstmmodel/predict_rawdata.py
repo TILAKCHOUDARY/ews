@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import argparse
 import numpy as np
 import pandas as pd
 import h5py
@@ -209,46 +210,53 @@ def predict_file(input_csv_path, weights_path, output_csv_path):
 
 
 if __name__ == '__main__':
+    # Provide a simple, robust CLI so you can run:
+    #   python predict_rawdata.py /full/path/to/combined_data.csv
+    # Optional flags: --weights / --output
     base = os.path.dirname(__file__)
-    weights = os.path.join(base, 'lstm_model_weights.weights.h5')
+    default_weights = os.path.join(base, 'lstm_model_weights.weights.h5')
 
-    # Accept a file number or direct CSV path via CLI arg or interactive prompt
-    arg = None
-    if len(sys.argv) > 1:
-        arg = sys.argv[1].strip()
-    else:
-        try:
-            arg = input("Enter rawdata file number (e.g., 26) or a CSV path: ").strip()
-        except Exception:
-            arg = ''
+    parser = argparse.ArgumentParser(description='Predict windows from raw IMU CSV using LSTM weights')
+    parser.add_argument('input_csv', help='Path to input CSV (absolute or relative). If a bare number is given, legacy attachments/rawdata_N.csv is used')
+    parser.add_argument('--weights', '-w', default=default_weights, help='Path to weights HDF5 file (default: lstm_model_weights.weights.h5 next to this script)')
+    parser.add_argument('--output', '-o', help='Output CSV path. Default: <input>_predicted.csv next to input file')
+    args = parser.parse_args()
 
-    if not arg:
-        # default to 26 if nothing provided
-        arg = '26'
+    arg = args.input_csv.strip()
+    weights = args.weights
 
-    # Resolve input/output paths
+    # If user passed a bare number (legacy behavior), resolve to attachments/rawdata_N.csv
     input_csv = None
     output_csv = None
 
-    # If arg looks like a CSV path, use it directly
-    if arg.lower().endswith('.csv') or os.sep in arg:
-        input_csv = arg if os.path.isabs(arg) else os.path.join(base, arg)
+    if arg.isdigit():
+        # legacy numbered files live in 'attachments' next to this script
+        input_csv = os.path.join(base, 'attachments', f'rawdata_{arg}.csv')
+        output_csv = os.path.join(base, 'attachments', f'rawdata_{arg}_predicted.csv')
+    else:
+        # Treat as a filesystem path. Accept relative or absolute.
+        # If extension missing, assume .csv
+        if not os.path.isabs(arg):
+            input_csv = os.path.abspath(arg)
+        else:
+            input_csv = arg
         if not input_csv.lower().endswith('.csv'):
             input_csv += '.csv'
-        # derive output next to the input file
-        in_dir, in_name = os.path.split(input_csv)
-        name_no_ext, _ = os.path.splitext(in_name)
-        output_csv = os.path.join(in_dir, f"{name_no_ext}_predicted.csv")
-    else:
-        # assume it's a number like '26'
-        if not arg.isdigit():
-            raise SystemExit(f"Invalid input '{arg}'. Provide a number (e.g., 26) or a CSV path.")
-        num = arg
-        input_csv = os.path.join(base, 'attachments', f'rawdata_{num}.csv')
-        output_csv = os.path.join(base, 'attachments', f'rawdata_{num}_predicted.csv')
+
+        # derive default output next to input unless overridden
+        if args.output:
+            output_csv = args.output
+        else:
+            in_dir, in_name = os.path.split(input_csv)
+            name_no_ext, _ = os.path.splitext(in_name)
+            output_csv = os.path.join(in_dir, f"{name_no_ext}_predicted.csv")
 
     # Validate input exists
     if not os.path.exists(input_csv):
         raise SystemExit(f"Input CSV not found: {input_csv}")
+
+    # Validate weights
+    if not os.path.exists(weights):
+        raise SystemExit(f"Weights file not found: {weights}")
 
     predict_file(input_csv, weights, output_csv)
