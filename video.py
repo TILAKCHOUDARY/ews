@@ -320,7 +320,7 @@ def cam_imu_thread():
         with camera_lock:
             if picam2_global is not None:
                 picam2_global.start_recording(encoder, video_path)
-                print(f"🎬 Video recording started: {video_path}")
+                print(f"🎬 Video recording started: {video_path}\n")
 
         imu_sample_count = 0
         last_print_time = time.time()
@@ -410,11 +410,9 @@ def cam_imu_thread():
             imu_sample_count += 1
             if time.time() - last_print_time >= 1.0:
                 video_timestamp = format_timestamp_for_video()
-                print(f"🎥 Recording: {video_timestamp}")
-                print(f"   IMU ({imu_sample_count} samples/s) -> ACC: {ax_g:.3f}, {ay_g:.3f}, {az_g:.3f} | "
-                      f"GYRO: {gx_dps:.3f}, {gy_dps:.3f}, {gz_dps:.3f}")
-                print(f"   GPS -> Lat:{gps_copy['lat']}{gps_copy['ns']} | "
-                      f"Lon:{gps_copy['lon']}{gps_copy['ew']} | Speed:{gps_copy['speed']}kn | Valid:{gps_copy['valid']}")
+                print(f"\n🎥 Recording: {video_timestamp}")
+                print(f"   IMU ({imu_sample_count} samples/s) -> ACC: {ax_g:.3f}, {ay_g:.3f}, {az_g:.3f} | GYRO: {gx_dps:.3f}, {gy_dps:.3f}, {gz_dps:.3f}")
+                print(f"   GPS -> Lat:{gps_copy['lat']}{gps_copy['ns']} | Lon:{gps_copy['lon']}{gps_copy['ew']} | Speed:{gps_copy['speed']}kn | Valid:{gps_copy['valid']}")
                 print("-" * 100)
                 imu_sample_count = 0
                 last_print_time = time.time()
@@ -447,18 +445,23 @@ def cam_imu_thread():
         except Exception as e:
             print(f"Camera stop error: {e}")
         
-        # Convert H264 to MP4
+        # Convert H264 to MP4 with timestamp overlay
         if video_path and os.path.exists(video_path):
             try:
-                print("🔄 Converting video to MP4...")
+                print("\n🔄 Converting video to MP4 with timestamp overlay...")
                 mp4_path = os.path.join(current_folder, "video.mp4")
+                
+                # Add timestamp overlay at bottom-right corner using ffmpeg
                 subprocess.run([
-                    'ffmpeg', '-i', video_path, '-c:v', 'copy', mp4_path
+                    'ffmpeg', '-i', video_path,
+                    '-vf', "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='%{localtime}':fontcolor=white:fontsize=36:box=1:boxcolor=black@0.5:boxborderw=5:x=w-tw-20:y=h-th-20",
+                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                    mp4_path
                 ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
                 os.remove(video_path)
-                print(f"✅ Video saved as: video.mp4")
+                print(f"✅ Video saved as: video.mp4\n")
             except Exception as e:
-                print(f"⚠️  Video conversion error: {e}")
+                print(f"⚠️  Video conversion error: {e}\n")
         
         try:
             if bus:
