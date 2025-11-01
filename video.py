@@ -27,6 +27,7 @@ running = False
 rider_id = None
 current_file_id = None
 current_folder = None
+recording_start_time = None
 gps_lock = Lock()
 latest_gps = {
     "utc": "N/A", "lat": "N/A", "ns": "N/A",
@@ -97,7 +98,7 @@ def parse_gprmc(line):
 
 # ========= Command Listener =========
 def command_listener():
-    global running, current_file_id, rider_id, current_folder, stop_event
+    global running, current_file_id, rider_id, current_folder, stop_event, recording_start_time
 
     last_command_id = None
 
@@ -121,33 +122,17 @@ def command_listener():
                     if command == "start" and not running:
                         running = True
                         stop_event.clear()
+                        recording_start_time = datetime.now()
                         
-                        # Create folder
-                        main_data_dir = "data"
-                        os.makedirs(main_data_dir, exist_ok=True)
-                        
-                        n = 1
-                        while os.path.exists(os.path.join(main_data_dir, f"ride{n:02d}")):
-                            n += 1
-                        
-                        current_folder = os.path.join(main_data_dir, f"ride{n:02d}")
-                        os.makedirs(current_folder, exist_ok=True)
-                        
-                        file_res = supabase.table("riderfiles").insert({
-                            "rider_id": rider_id,
-                            "filename": f"ride_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            "filepath": current_folder
-                        }).execute()
-                        current_file_id = file_res.data[0]["id"]
-
                         print(f"\n{'='*70}")
-                        print(f"🚀 START RECORDING")
-                        print(f"   Rider ID: {rider_id} | Folder: {current_folder}")
+                        print(f"🚀 START RECORDING - Rider ID: {rider_id}")
                         print(f"{'='*70}")
 
+                        # Start threads FIRST
                         Thread(target=gps_thread, daemon=False).start()
                         Thread(target=cam_imu_thread, daemon=False).start()
 
+                        # Mark command as executed
                         supabase.table("rider_commands")\
                             .update({"status": "executed"})\
                             .eq("id", latest["id"])\
@@ -161,14 +146,15 @@ def command_listener():
                         print(f"🛑 STOP RECORDING - Processing...")
                         print(f"{'='*70}")
                         
-                        time.sleep(3)  # Wait for threads to finish
+                        time.sleep(5)  # Wait for threads
                         
                         cleanup_camera()
                         reset_camera()
                         
-                        print(f"\n✅ Data saved in: {current_folder}")
-                        print(f"   - combined_data.csv")
-                        print(f"   - video.mp4 (with timestamp)\n")
+                        if current_folder:
+                            print(f"\n✅ SAVED: {current_folder}")
+                            print(f"   - combined_data.csv")
+                            print(f"   - video.mp4 (with timestamp TOP-LEFT)\n")
                         
                         supabase.table("rider_commands")\
                             .update({"status": "executed"})\
@@ -177,6 +163,7 @@ def command_listener():
                         
                         current_file_id = None
                         current_folder = None
+                        recording_start_time = None
 
         except Exception as e:
             print(f"❌ Command error: {e}")
@@ -203,7 +190,31 @@ def gps_thread():
 
 # ========= Video + IMU Thread =========
 def cam_imu_thread():
-    global picam2_global
+    global picam2_global, current_folder, current_file_id
+    
+    # CREATE FOLDER HERE - ONLY ONCE
+    main_data_dir = "data"
+    os.makedirs(main_data_dir, exist_ok=True)
+    
+    n = 1
+    while os.path.exists(os.path.join(main_data_dir, f"ride{n:02d}")):
+        n += 1
+    
+    current_folder = os.path.join(main_data_dir, f"ride{n:02d}")
+    os.makedirs(current_folder, exist_ok=True)
+    
+    print(f"📁 Folder created: {current_folder}")
+    
+    # Create file record in Supabase
+    try:
+        file_res = supabase.table("riderfiles").insert({
+            "rider_id": rider_id,
+            "filename": f"ride_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            "filepath": current_folder
+        }).execute()
+        current_file_id = file_res.data[0]["id"]
+    except Exception as e:
+        print(f"⚠️  Supabase file record error: {e}")
     
     reset_camera()
 
@@ -213,8 +224,9 @@ def cam_imu_thread():
         bus = SMBus(BUS_NUM)
         bus.write_byte_data(ADDR, PWR_MGMT_1, 0)
         time.sleep(0.1)
+        print("✅ IMU initialized")
     except Exception as e:
-        print(f"❌ IMU initialization failed: {e}")
+        print(f"❌ IMU error: {e}")
         return
 
     # Camera Setup
@@ -228,16 +240,16 @@ def cam_imu_thread():
             picam2_global.start()
             
         time.sleep(2)
+        print("✅ Camera initialized")
         
     except Exception as e:
-        print(f"❌ Camera initialization failed: {e}")
+        print(f"❌ Camera error: {e}")
         if bus:
             bus.close()
         return
 
     csv_file = None
     video_path = None
-    recording_start_time = None
 
     try:
         # CSV File
@@ -251,6 +263,7 @@ def cam_imu_thread():
             "gps_utc", "gps_lat", "gps_ns", "gps_lon", "gps_ew",
             "gps_speed_kn", "gps_course_deg", "gps_valid"
         ])
+        print(f"✅ CSV created: combined_data.csv")
 
         # Video Recording
         video_path = os.path.join(current_folder, "video.h264")
@@ -259,9 +272,8 @@ def cam_imu_thread():
         with camera_lock:
             if picam2_global is not None:
                 picam2_global.start_recording(encoder, video_path)
-                recording_start_time = datetime.now()
+                print(f"✅ Recording started: video.h264\n")
 
-        print(f"\n📹 Recording started...")
         print(f"{'─'*70}")
 
         last_print = time.time()
@@ -343,18 +355,14 @@ def cam_imu_thread():
             except:
                 pass
 
-            # Print status every second
+            # Print status
             sample_count += 1
             if time.time() - last_print >= 1.0:
                 elapsed = (datetime.now() - recording_start_time).total_seconds()
                 mins = int(elapsed // 60)
                 secs = int(elapsed % 60)
                 
-                print(f"⏱️  {mins:02d}:{secs:02d} | "
-                      f"ACC: {ax_g:+.2f},{ay_g:+.2f},{az_g:+.2f} | "
-                      f"GYRO: {gx_dps:+.1f},{gy_dps:+.1f},{gz_dps:+.1f} | "
-                      f"GPS: {gps_copy['lat'][:8]}{gps_copy['ns']},{gps_copy['lon'][:8]}{gps_copy['ew']} | "
-                      f"Samples: {sample_count}/s")
+                print(f"⏱️  {mins:02d}:{secs:02d} | ACC: {ax_g:+.2f},{ay_g:+.2f},{az_g:+.2f} | GYRO: {gx_dps:+.1f},{gy_dps:+.1f},{gz_dps:+.1f} | GPS: {gps_copy['valid']}")
                 
                 sample_count = 0
                 last_print = time.time()
@@ -371,6 +379,7 @@ def cam_imu_thread():
         # Close CSV
         if csv_file:
             csv_file.close()
+            print("\n💾 CSV saved")
         
         # Stop camera
         with camera_lock:
@@ -379,41 +388,76 @@ def cam_imu_thread():
                     picam2_global.stop_recording()
                     time.sleep(0.5)
                     picam2_global.stop()
+                    print("🎬 Recording stopped")
                 except:
                     pass
         
-        print(f"\n{'─'*70}")
-        print("🔄 Converting video with timestamp...")
+        print(f"{'─'*70}")
+        print("🔄 Converting to MP4 with timestamp overlay...")
         
-        # Convert to MP4 with timestamp - TOP LEFT
+        # Convert H264 to MP4 with ACTUAL TIMESTAMP from recording
         if video_path and os.path.exists(video_path):
             try:
                 mp4_path = os.path.join(current_folder, "video.mp4")
                 
+                # Create timestamp overlay file
+                timestamp_file = os.path.join(current_folder, "timestamps.txt")
+                with open(timestamp_file, 'w') as tf:
+                    # Get video duration
+                    result = subprocess.run(
+                        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
+                         '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
+                        capture_output=True, text=True
+                    )
+                    duration = float(result.stdout.strip())
+                    
+                    # Generate timestamp for each frame (assuming 30fps)
+                    fps = 30
+                    for frame in range(int(duration * fps)):
+                        time_offset = frame / fps
+                        timestamp = recording_start_time + timedelta(seconds=time_offset)
+                        tf.write(f"{timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                
+                # Apply timestamp overlay - TOP LEFT CORNER
                 subprocess.run([
                     'ffmpeg', '-y', '-i', video_path,
-                    '-vf', "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='%{localtime}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.7:boxborderw=8:x=20:y=20",
+                    '-vf', f"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:textfile={timestamp_file}:reload=1:fontcolor=white:fontsize=48:box=1:boxcolor=black@0.8:boxborderw=8:x=2:y=2",
                     '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', 23,
                     mp4_path
                 ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=180)
                 
+                # Cleanup
                 os.remove(video_path)
-                print("✅ Video conversion complete")
+                os.remove(timestamp_file)
+                print("✅ Video with timestamp saved: video.mp4")
+                
             except Exception as e:
                 print(f"⚠️  Video conversion failed: {e}")
-                print(f"   H264 file kept: video.h264")
+                print("   Trying simple method...")
+                try:
+                    # Fallback - simple localtime overlay
+                    subprocess.run([
+                        'ffmpeg', '-y', '-i', video_path,
+                        '-vf', "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='%{localtime}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.8:boxborderw=8:x=30:y=30",
+                        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', 23,
+                        mp4_path
+                    ], check=True, timeout=120)
+                    os.remove(video_path)
+                    print("✅ Video with timestamp saved (fallback): video.mp4")
+                except:
+                    print(f"⚠️  Kept H264: video.h264")
         
         if bus:
             bus.close()
+        
+        print(f"{'─'*70}")
 
 # ========= Main =========
 if __name__ == "__main__":
     print("\n" + "="*70)
     print("  🎥 IMU + GPS + VIDEO DATA LOGGER")
     print("="*70)
-    print(f"  📊 IMU Rate: {IMU_RATE} Hz")
-    print(f"  🎬 Video: 1920x1080 with TOP-LEFT timestamp")
-    print(f"  ☁️  Supabase: Real-time sync enabled")
+    print(f"  IMU: {IMU_RATE} Hz | Video: 1920x1080 | Timestamp: TOP-LEFT")
     print("="*70 + "\n")
     
     reset_camera()
@@ -421,8 +465,7 @@ if __name__ == "__main__":
     try:
         Thread(target=command_listener, daemon=True).start()
         
-        print("⏳ WAITING FOR START COMMAND FROM WEBSITE...")
-        print("   Send START command from Supabase to begin recording\n")
+        print("⏳ WAITING FOR START COMMAND...\n")
         
         while True:
             time.sleep(1)
@@ -432,8 +475,6 @@ if __name__ == "__main__":
         stop_event.set()
         cleanup_camera()
         reset_camera()
-        print("✅ Exit complete\n")
-    except Exception as e:
-        print(f"\n❌ Fatal error: {e}\n")
+        print("✅ Exit\n")
     finally:
         cleanup_camera()
