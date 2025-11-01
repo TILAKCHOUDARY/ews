@@ -1,4 +1,4 @@
-import os, csv, time, serial, subprocess
+import os, csv, time, serial, subprocess, sys
 from datetime import datetime
 from threading import Thread, Lock, Event
 from smbus2 import SMBus
@@ -46,7 +46,8 @@ camera_lock = Lock()
 def reset_camera():
     """Reset camera by killing any existing processes"""
     try:
-        print("🔄 Resetting camera processes...")
+        sys.stdout.write("🔄 Resetting camera processes...\n")
+        sys.stdout.flush()
         subprocess.run(['sudo', 'killall', '-9', 'libcamera-hello'], 
                       stderr=subprocess.DEVNULL)
         subprocess.run(['sudo', 'killall', '-9', 'libcamera-still'], 
@@ -56,9 +57,11 @@ def reset_camera():
         subprocess.run(['sudo', 'pkill', '-9', '-f', 'libcamera'], 
                       stderr=subprocess.DEVNULL)
         time.sleep(3)
-        print("✅ Camera processes reset complete")
+        sys.stdout.write("✅ Camera processes reset complete\n")
+        sys.stdout.flush()
     except Exception as e:
-        print(f"⚠️  Camera reset error (non-critical): {e}")
+        sys.stdout.write(f"⚠️  Camera reset error (non-critical): {e}\n")
+        sys.stdout.flush()
 
 def cleanup_camera():
     """Properly cleanup camera object"""
@@ -66,15 +69,18 @@ def cleanup_camera():
     with camera_lock:
         if picam2_global is not None:
             try:
-                print("🛑 Stopping camera...")
+                sys.stdout.write("🛑 Stopping camera...\n")
+                sys.stdout.flush()
                 picam2_global.stop_recording()
                 time.sleep(0.5)
                 picam2_global.stop()
                 picam2_global.close()
                 time.sleep(1)
-                print("✅ Camera stopped and closed")
+                sys.stdout.write("✅ Camera stopped and closed\n")
+                sys.stdout.flush()
             except Exception as e:
-                print(f"⚠️  Camera cleanup error: {e}")
+                sys.stdout.write(f"⚠️  Camera cleanup error: {e}\n")
+                sys.stdout.flush()
             finally:
                 picam2_global = None
 
@@ -88,7 +94,8 @@ def read_word(bus, addr, reg):
             val -= 0x10000
         return val
     except Exception as e:
-        print(f"IMU read error: {e}")
+        sys.stdout.write(f"IMU read error: {e}\n")
+        sys.stdout.flush()
         return 0
 
 def setup_data_folder():
@@ -135,7 +142,8 @@ def command_listener():
     global gps_thread_obj, cam_imu_thread_obj, stop_event
 
     last_command_id = None
-    print("👂 Command listener started - waiting for commands...")
+    sys.stdout.write("👂 Command listener started - waiting for commands...\n")
+    sys.stdout.flush()
 
     while True:
         try:
@@ -167,20 +175,23 @@ def command_listener():
                         }).execute()
                         current_file_id = file_res.data[0]["id"]
 
-                        print(f"\n{'='*60}")
-                        print(f"🚀 START command received!")
-                        print(f"👤 Rider ID: {rider_id}")
-                        print(f"📄 File ID: {current_file_id}")
-                        print(f"📁 Data folder: {current_folder}")
-                        print(f"{'='*60}\n")
+                        sys.stdout.write(f"\n{'='*60}\n")
+                        sys.stdout.write(f"🚀 START command received!\n")
+                        sys.stdout.write(f"👤 Rider ID: {rider_id}\n")
+                        sys.stdout.write(f"📄 File ID: {current_file_id}\n")
+                        sys.stdout.write(f"📁 Data folder: {current_folder}\n")
+                        sys.stdout.write(f"{'='*60}\n\n")
+                        sys.stdout.flush()
 
                         gps_thread_obj = Thread(target=gps_thread, daemon=False)
                         gps_thread_obj.start()
-                        print("📡  GPS thread STARTED")
+                        sys.stdout.write("📡  GPS thread STARTED\n")
+                        sys.stdout.flush()
 
                         cam_imu_thread_obj = Thread(target=cam_imu_thread, daemon=False)
                         cam_imu_thread_obj.start()
-                        print("🎥 Video/IMU thread STARTED")
+                        sys.stdout.write("🎥 Video/IMU thread STARTED\n\n")
+                        sys.stdout.flush()
 
                         supabase.table("rider_commands")\
                             .update({"status": "executed"})\
@@ -191,24 +202,28 @@ def command_listener():
                         running = False
                         stop_event.set()
                         
-                        print(f"\n{'='*60}")
-                        print(f"🛑 STOP command received!")
-                        print(f"👤 Rider ID: {rider_id}")
-                        print(f"ℹ️ Stopping threads...")
-                        print(f"{'='*60}\n")
+                        sys.stdout.write(f"\n{'='*60}\n")
+                        sys.stdout.write(f"🛑 STOP command received!\n")
+                        sys.stdout.write(f"👤 Rider ID: {rider_id}\n")
+                        sys.stdout.write(f"ℹ️ Stopping threads...\n")
+                        sys.stdout.write(f"{'='*60}\n\n")
+                        sys.stdout.flush()
                         
                         if gps_thread_obj and gps_thread_obj.is_alive():
                             gps_thread_obj.join(timeout=5)
-                            print("✅ GPS thread STOPPED")
+                            sys.stdout.write("✅ GPS thread STOPPED\n")
+                            sys.stdout.flush()
                         
                         if cam_imu_thread_obj and cam_imu_thread_obj.is_alive():
                             cam_imu_thread_obj.join(timeout=10)
-                            print("✅ Video/IMU thread STOPPED")
+                            sys.stdout.write("✅ Video/IMU thread STOPPED\n")
+                            sys.stdout.flush()
                         
                         cleanup_camera()
                         reset_camera()
                         
-                        print(f"💾 Data saved in: {current_folder}\n")
+                        sys.stdout.write(f"💾 Data saved in: {current_folder}\n\n")
+                        sys.stdout.flush()
                         
                         supabase.table("rider_commands")\
                             .update({"status": "executed"})\
@@ -220,17 +235,20 @@ def command_listener():
                         gps_thread_obj = None
                         cam_imu_thread_obj = None
                         
-                        print("🔄 System ready for next ride\n")
+                        sys.stdout.write("🔄 System ready for next ride\n\n")
+                        sys.stdout.flush()
 
         except Exception as e:
-            print(f"❌  Command listener error: {e}")
+            sys.stdout.write(f"❌  Command listener error: {e}\n")
+            sys.stdout.flush()
         
         time.sleep(1)
 
 # ========= GPS Thread =========
 def gps_thread():
     """GPS data collection thread"""
-    print("📡  GPS collection starting...")
+    sys.stdout.write("📡  GPS collection starting...\n")
+    sys.stdout.flush()
     
     try:
         with serial.Serial(GPS_PORT, GPS_BAUD, timeout=1) as ser:
@@ -244,19 +262,23 @@ def gps_thread():
                                 latest_gps.update(gps_data)
                 except Exception as e:
                     if not stop_event.is_set():
-                        print(f"GPS error: {e}")
+                        sys.stdout.write(f"GPS error: {e}\n")
+                        sys.stdout.flush()
                     time.sleep(1)
     except Exception as e:
-        print(f"GPS serial error: {e}")
+        sys.stdout.write(f"GPS serial error: {e}\n")
+        sys.stdout.flush()
     
-    print("📡  GPS thread exiting...")
+    sys.stdout.write("📡  GPS thread exiting...\n")
+    sys.stdout.flush()
 
 # ========= Video + IMU Thread =========
 def cam_imu_thread():
     """Combined video recording and IMU thread - IMU at 10Hz"""
     global picam2_global
     
-    print("🎥 Video/IMU initialization starting...")
+    sys.stdout.write("🎥 Video/IMU initialization starting...\n")
+    sys.stdout.flush()
     reset_camera()
 
     # Setup IMU
@@ -265,31 +287,38 @@ def cam_imu_thread():
         bus = SMBus(BUS_NUM)
         bus.write_byte_data(ADDR, PWR_MGMT_1, 0)
         time.sleep(0.1)
-        print("✅ IMU initialized successfully")
+        sys.stdout.write("✅ IMU initialized successfully\n")
+        sys.stdout.flush()
     except Exception as e:
-        print(f"❌ IMU initialization error: {e}")
+        sys.stdout.write(f"❌ IMU initialization error: {e}\n")
+        sys.stdout.flush()
         return
 
     # Setup camera for video recording
     try:
         with camera_lock:
-            print("🎥 Creating Picamera2 instance...")
+            sys.stdout.write("🎥 Creating Picamera2 instance...\n")
+            sys.stdout.flush()
             picam2_global = Picamera2()
             
-            print("🎥 Configuring camera for video...")
+            sys.stdout.write("🎥 Configuring camera for video...\n")
+            sys.stdout.flush()
             video_config = picam2_global.create_video_configuration(
                 main={"size": (1920, 1080), "format": "RGB888"}
             )
             picam2_global.configure(video_config)
             
-            print("🎥 Starting camera...")
+            sys.stdout.write("🎥 Starting camera...\n")
+            sys.stdout.flush()
             picam2_global.start()
             
         time.sleep(2)
-        print("✅ Camera initialized successfully")
+        sys.stdout.write("✅ Camera initialized successfully\n")
+        sys.stdout.flush()
         
     except Exception as e:
-        print(f"❌ Camera initialization error: {e}")
+        sys.stdout.write(f"❌ Camera initialization error: {e}\n")
+        sys.stdout.flush()
         if bus:
             bus.close()
         return
@@ -311,7 +340,8 @@ def cam_imu_thread():
             "gps_utc", "gps_lat", "gps_ns", "gps_lon", "gps_ew",
             "gps_speed_kn", "gps_course_deg", "gps_valid"
         ])
-        print(f"📝 CSV file created: {csv_path}")
+        sys.stdout.write(f"📝 CSV file created: {csv_path}\n")
+        sys.stdout.flush()
 
         # Start video recording
         video_path = os.path.join(current_folder, "video.h264")
@@ -320,7 +350,8 @@ def cam_imu_thread():
         with camera_lock:
             if picam2_global is not None:
                 picam2_global.start_recording(encoder, video_path)
-                print(f"🎬 Video recording started: {video_path}\n")
+                sys.stdout.write(f"🎬 Video recording started: {video_path}\n\n")
+                sys.stdout.flush()
 
         imu_sample_count = 0
         last_print_time = time.time()
@@ -404,16 +435,18 @@ def cam_imu_thread():
 
             except Exception as e:
                 if not stop_event.is_set():
-                    print(f"❌  Supabase push error: {e}")
+                    sys.stdout.write(f"❌  Supabase push error: {e}\n")
+                    sys.stdout.flush()
 
             # Console output every second (after 10 samples)
             imu_sample_count += 1
             if time.time() - last_print_time >= 1.0:
                 video_timestamp = format_timestamp_for_video()
-                print(f"\n🎥 Recording: {video_timestamp}")
-                print(f"   IMU ({imu_sample_count} samples/s) -> ACC: {ax_g:.3f}, {ay_g:.3f}, {az_g:.3f} | GYRO: {gx_dps:.3f}, {gy_dps:.3f}, {gz_dps:.3f}")
-                print(f"   GPS -> Lat:{gps_copy['lat']}{gps_copy['ns']} | Lon:{gps_copy['lon']}{gps_copy['ew']} | Speed:{gps_copy['speed']}kn | Valid:{gps_copy['valid']}")
-                print("-" * 100)
+                sys.stdout.write(f"🎥 Recording: {video_timestamp}\n")
+                sys.stdout.write(f"   IMU ({imu_sample_count} samples/s) -> ACC: {ax_g:.3f}, {ay_g:.3f}, {az_g:.3f} | GYRO: {gx_dps:.3f}, {gy_dps:.3f}, {gz_dps:.3f}\n")
+                sys.stdout.write(f"   GPS -> Lat:{gps_copy['lat']}{gps_copy['ns']} | Lon:{gps_copy['lon']}{gps_copy['ew']} | Speed:{gps_copy['speed']}kn | Valid:{gps_copy['valid']}\n")
+                sys.stdout.write("-" * 100 + "\n")
+                sys.stdout.flush()
                 imu_sample_count = 0
                 last_print_time = time.time()
 
@@ -425,15 +458,18 @@ def cam_imu_thread():
 
     except Exception as e:
         if not stop_event.is_set():
-            print(f"❌ Main loop error: {e}")
+            sys.stdout.write(f"❌ Main loop error: {e}\n")
+            sys.stdout.flush()
     finally:
         # Cleanup
         try:
             if csv_file:
                 csv_file.close()
-                print("💾 CSV file closed")
+                sys.stdout.write("💾 CSV file closed\n")
+                sys.stdout.flush()
         except Exception as e:
-            print(f"CSV cleanup error: {e}")
+            sys.stdout.write(f"CSV cleanup error: {e}\n")
+            sys.stdout.flush()
         
         try:
             with camera_lock:
@@ -441,69 +477,89 @@ def cam_imu_thread():
                     picam2_global.stop_recording()
                     time.sleep(0.5)
                     picam2_global.stop()
-                    print("🎥 Video recording stopped")
+                    sys.stdout.write("🎥 Video recording stopped\n")
+                    sys.stdout.flush()
         except Exception as e:
-            print(f"Camera stop error: {e}")
+            sys.stdout.write(f"Camera stop error: {e}\n")
+            sys.stdout.flush()
         
         # Convert H264 to MP4 with timestamp overlay
         if video_path and os.path.exists(video_path):
             try:
-                print("\n🔄 Converting video to MP4 with timestamp overlay...")
+                sys.stdout.write("\n🔄 Converting video to MP4 with timestamp overlay...\n")
+                sys.stdout.flush()
                 mp4_path = os.path.join(current_folder, "video.mp4")
                 
                 # Add timestamp overlay at bottom-right corner using ffmpeg
-                subprocess.run([
-                    'ffmpeg', '-i', video_path,
-                    '-vf', "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='%{localtime}':fontcolor=white:fontsize=36:box=1:boxcolor=black@0.5:boxborderw=5:x=w-tw-20:y=h-th-20",
-                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                result = subprocess.run([
+                    'ffmpeg', '-y', '-i', video_path,
+                    '-vf', "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='%{localtime\\:%I\\\\:%M\\\\:%S %p}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.7:boxborderw=8:x=w-tw-30:y=h-th-30",
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
                     mp4_path
-                ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-                os.remove(video_path)
-                print(f"✅ Video saved as: video.mp4\n")
+                ], capture_output=True, text=True)
+                
+                if result.returncode == 0:
+                    os.remove(video_path)
+                    sys.stdout.write(f"✅ Video saved as: video.mp4\n\n")
+                    sys.stdout.flush()
+                else:
+                    sys.stdout.write(f"⚠️  FFmpeg error: {result.stderr}\n\n")
+                    sys.stdout.flush()
             except Exception as e:
-                print(f"⚠️  Video conversion error: {e}\n")
+                sys.stdout.write(f"⚠️  Video conversion error: {e}\n\n")
+                sys.stdout.flush()
         
         try:
             if bus:
                 bus.close()
-                print("🔌 IMU bus closed")
+                sys.stdout.write("🔌 IMU bus closed\n")
+                sys.stdout.flush()
         except Exception as e:
-            print(f"IMU cleanup error: {e}")
+            sys.stdout.write(f"IMU cleanup error: {e}\n")
+            sys.stdout.flush()
     
-    print("🎥 Video/IMU thread exiting...")
+    sys.stdout.write("🎥 Video/IMU thread exiting...\n")
+    sys.stdout.flush()
 
 # ========= Main =========
 if __name__ == "__main__":
-    print("=" * 60)
-    print("   IMU + Video + GPS Data Logger with Supabase")
-    print("=" * 60)
-    print(f"☁️  Supabase: Real-time updates enabled")
-    print(f"🎧 Listening for commands from ANY rider")
-    print(f"📊 IMU Rate: {IMU_RATE} Hz | Video: {VIDEO_FPS} FPS")
-    print("-" * 60)
+    sys.stdout.write("=" * 60 + "\n")
+    sys.stdout.write("   IMU + Video + GPS Data Logger with Supabase\n")
+    sys.stdout.write("=" * 60 + "\n")
+    sys.stdout.write(f"☁️  Supabase: Real-time updates enabled\n")
+    sys.stdout.write(f"🎧 Listening for commands from ANY rider\n")
+    sys.stdout.write(f"📊 IMU Rate: {IMU_RATE} Hz | Video: {VIDEO_FPS} FPS\n")
+    sys.stdout.write("-" * 60 + "\n")
+    sys.stdout.flush()
     
     reset_camera()
     
     try:
         t_cmd = Thread(target=command_listener, daemon=True)
-        print("🚀 Starting command listener...")
+        sys.stdout.write("🚀 Starting command listener...\n")
+        sys.stdout.flush()
         t_cmd.start()
         
-        print("\n⏳  WAITING FOR START COMMAND FROM WEBSITE...")
-        print("   GPS and Video threads will start when START is received")
-        print("=" * 60)
+        sys.stdout.write("\n⏳  WAITING FOR START COMMAND FROM WEBSITE...\n")
+        sys.stdout.write("   GPS and Video threads will start when START is received\n")
+        sys.stdout.write("=" * 60 + "\n")
+        sys.stdout.flush()
         
         while True:
             time.sleep(1)
         
     except KeyboardInterrupt:
-        print("\n⛔ Received stop signal...")
+        sys.stdout.write("\n⛔ Received stop signal...\n")
+        sys.stdout.flush()
         stop_event.set()
         cleanup_camera()
         reset_camera()
-        print("👋 Exiting program...")
+        sys.stdout.write("👋 Exiting program...\n")
+        sys.stdout.flush()
     except Exception as e:
-        print(f"❌ Error: {e}")
+        sys.stdout.write(f"❌ Error: {e}\n")
+        sys.stdout.flush()
     finally:
         cleanup_camera()
-        print("✅ Program ended.")
+        sys.stdout.write("✅ Program ended.\n")
+        sys.stdout.flush()
