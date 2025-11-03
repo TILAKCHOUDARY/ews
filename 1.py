@@ -1,6 +1,7 @@
 import os, csv, time, serial, uuid, subprocess
 from datetime import datetime
 from threading import Thread, Lock, Event
+from queue import Queue
 from smbus2 import SMBus
 from picamera2 import Picamera2
 from supabase import create_client
@@ -46,10 +47,14 @@ latest_gps = {
 # Latest camera image filename (updated 10 Hz, used by all IMU samples)
 latest_image_filename = "N/A"
 
+# Upload queue for non-blocking Supabase uploads
+upload_queue = Queue()
+
 # Thread references
 gps_thread_obj = None
 imu_thread_obj = None
 camera_thread_obj = None
+upload_thread_obj = None
 stop_event = Event()
 
 # Camera object
@@ -71,7 +76,7 @@ def reset_camera():
         time.sleep(3)
         print("✅ Camera processes reset complete")
     except Exception as e:
-        print(f"⚠️  Camera reset error (non-critical): {e}")
+        print(f"⚠️ Camera reset error (non-critical): {e}")
 
 def cleanup_camera():
     """Properly cleanup camera object"""
@@ -85,7 +90,7 @@ def cleanup_camera():
                 time.sleep(1)
                 print("✅ Camera stopped and closed")
             except Exception as e:
-                print(f"⚠️  Camera cleanup error: {e}")
+                print(f"⚠️ Camera cleanup error: {e}")
             finally:
                 picam2_global = None
 
@@ -135,11 +140,39 @@ def parse_gprmc(line):
         pass
     return None
 
+# ========= Upload Thread (Non-blocking Supabase uploads) =========
+def upload_thread():
+    """Dedicated thread for Supabase uploads - doesn't block IMU sampling"""
+    print("📤 Upload thread started...")
+    
+    while not stop_event.is_set():
+        try:
+            # Get data from queue (with timeout to check stop_event)
+            try:
+                data = upload_queue.get(timeout=1)
+            except:
+                continue
+            
+            # Upload to Supabase
+            try:
+                supabase.table("riderdata").insert(data).execute()
+            except Exception as e:
+                if not stop_event.is_set():
+                    print(f"❌ Supabase upload error: {e}")
+            finally:
+                upload_queue.task_done()
+                
+        except Exception as e:
+            if not stop_event.is_set():
+                print(f"❌ Upload thread error: {e}")
+    
+    print("📤 Upload thread exiting...")
+
 # ========= Command Listener Thread =========
 def command_listener():
     """Listen for START/STOP commands from Supabase"""
     global running, current_file_id, rider_id, current_folder
-    global gps_thread_obj, imu_thread_obj, camera_thread_obj, stop_event
+    global gps_thread_obj, imu_thread_obj, camera_thread_obj, upload_thread_obj, stop_event
     global latest_image_filename
 
     last_command_id = None
@@ -186,6 +219,11 @@ def command_listener():
                         print(f"📁 Data folder: {current_folder}")
                         print(f"{'='*60}\n")
 
+                        # START UPLOAD THREAD (handles Supabase uploads without blocking)
+                        upload_thread_obj = Thread(target=upload_thread, daemon=False)
+                        upload_thread_obj.start()
+                        print("📤 Upload thread STARTED (non-blocking uploads)")
+
                         # START GPS THREAD (1 Hz - updates latest_gps)
                         gps_thread_obj = Thread(target=gps_thread, daemon=False)
                         gps_thread_obj.start()
@@ -229,6 +267,12 @@ def command_listener():
                             imu_thread_obj.join(timeout=5)
                             print("✅ IMU thread STOPPED")
                         
+                        if upload_thread_obj and upload_thread_obj.is_alive():
+                            # Wait for queue to be empty
+                            upload_queue.join()
+                            upload_thread_obj.join(timeout=10)
+                            print("✅ Upload thread STOPPED")
+                        
                         cleanup_camera()
                         reset_camera()
                         
@@ -244,6 +288,7 @@ def command_listener():
                         gps_thread_obj = None
                         imu_thread_obj = None
                         camera_thread_obj = None
+                        upload_thread_obj = None
                         
                         print("🔄 System ready for next ride\n")
 
@@ -267,7 +312,7 @@ def gps_thread():
                         if gps_data:
                             with gps_lock:
                                 latest_gps.update(gps_data)
-                            print(f"📍 GPS updated: {gps_data['lat']}{gps_data['ns']} {gps_data['lon']}{gps_data['ew']} (used by all IMU samples)")
+                            print(f"🛰️ GPS updated: {gps_data['lat']}{gps_data['ns']} {gps_data['lon']}{gps_data['ew']} (used by all IMU samples)")
                 except Exception as e:
                     if not stop_event.is_set():
                         print(f"GPS error: {e}")
@@ -335,7 +380,7 @@ def camera_thread():
                 print(f"📷 Image captured: {filename} (now used by all IMU samples)")
             except Exception as e:
                 if not stop_event.is_set():
-                    print(f"⚠️  Camera capture error: {e}")
+                    print(f"⚠️ Camera capture error: {e}")
 
             # Maintain 10 Hz timing
             elapsed = time.time() - loop_start
@@ -358,7 +403,7 @@ def camera_thread():
 def imu_thread():
     """High-speed IMU data collection at 100 Hz - uses latest GPS and image"""
     print("📊 IMU collection starting at 100 Hz...")
-    print("   📍 Using latest GPS data (updates ~1 Hz)")
+    print("   🛰️ Using latest GPS data (updates ~1 Hz)")
     print("   📷 Using latest image filename (updates 10 Hz)")
     
     # Setup IMU
@@ -375,6 +420,7 @@ def imu_thread():
     csv_file = None
     csv_writer = None
     sample_count = 0
+    last_print_time = time.time()
 
     try:
         # Open CSV file for IMU data
@@ -417,15 +463,15 @@ def imu_thread():
             gy_dps = gy / 131.0
             gz_dps = gz / 131.0
 
-            # Get LATEST GPS data (may be same for multiple samples)
+            # Get LATEST GPS data (same value until GPS updates)
             with gps_lock:
                 gps_copy = latest_gps.copy()
 
-            # Get LATEST image filename (may be same for multiple samples)
+            # Get LATEST image filename (same value until camera captures new image)
             with latest_image_lock:
                 current_image = latest_image_filename
 
-            # Write to CSV - every IMU sample gets latest GPS + latest image
+            # Write to CSV - EVERY sample gets latest GPS + latest image
             csv_writer.writerow([
                 timestamp_str, epoch_time, sample_count, current_image,
                 round(ax_g, 4), round(ay_g, 4), round(az_g, 4),
@@ -438,50 +484,53 @@ def imu_thread():
             # Flush every 100 samples (1 second)
             if sample_count % 100 == 0:
                 csv_file.flush()
-                print(f"📊 IMU: {sample_count} samples | GPS: {gps_copy['lat']}{gps_copy['ns']} | Image: {current_image}")
+                current_time = time.time()
+                actual_rate = 100 / (current_time - last_print_time)
+                print(f"📊 IMU: {sample_count} samples | Actual rate: {actual_rate:.1f} Hz | GPS: {gps_copy['lat']}{gps_copy['ns']} | Image: {current_image}")
+                last_print_time = current_time
 
-            # Upload to Supabase every 10 samples (0.1 second intervals)
-            if sample_count % 10 == 0:
-                try:
-                    speed_val = None
-                    course_val = None
-                    
-                    if gps_copy["speed"] != "N/A":
-                        try:
-                            speed_val = float(gps_copy["speed"])
-                        except:
-                            pass
-                    
-                    if gps_copy["course"] != "N/A":
-                        try:
-                            course_val = float(gps_copy["course"])
-                        except:
-                            pass
+            # Queue data for Supabase upload (non-blocking)
+            try:
+                speed_val = None
+                course_val = None
+                
+                if gps_copy["speed"] != "N/A":
+                    try:
+                        speed_val = float(gps_copy["speed"])
+                    except:
+                        pass
+                
+                if gps_copy["course"] != "N/A":
+                    try:
+                        course_val = float(gps_copy["course"])
+                    except:
+                        pass
 
-                    supabase.table("riderdata").insert({
-                        "rider_id": rider_id,
-                        "file_id": current_file_id,
-                        "timestamp": now.isoformat(),
-                        "ax": round(ax_g, 4),
-                        "ay": round(ay_g, 4),
-                        "az": round(az_g, 4),
-                        "gx": round(gx_dps, 3),
-                        "gy": round(gy_dps, 3),
-                        "gz": round(gz_dps, 3),
-                        "gps_utc": gps_copy["utc"],
-                        "gps_lat": gps_copy["lat"],
-                        "gps_ns": gps_copy["ns"],
-                        "gps_lon": gps_copy["lon"],
-                        "gps_ew": gps_copy["ew"],
-                        "gps_speed_kn": speed_val,
-                        "gps_course_deg": course_val,
-                        "gps_valid": gps_copy["valid"],
-                        "image_filename": current_image
-                    }).execute()
+                # Put data in queue - this is non-blocking
+                upload_queue.put({
+                    "rider_id": rider_id,
+                    "file_id": current_file_id,
+                    "timestamp": now.isoformat(),
+                    "ax": round(ax_g, 4),
+                    "ay": round(ay_g, 4),
+                    "az": round(az_g, 4),
+                    "gx": round(gx_dps, 3),
+                    "gy": round(gy_dps, 3),
+                    "gz": round(gz_dps, 3),
+                    "gps_utc": gps_copy["utc"],
+                    "gps_lat": gps_copy["lat"],
+                    "gps_ns": gps_copy["ns"],
+                    "gps_lon": gps_copy["lon"],
+                    "gps_ew": gps_copy["ew"],
+                    "gps_speed_kn": speed_val,
+                    "gps_course_deg": course_val,
+                    "gps_valid": gps_copy["valid"],
+                    "image_filename": current_image
+                })
 
-                except Exception as e:
-                    if not stop_event.is_set():
-                        print(f"❌ Supabase upload error: {e}")
+            except Exception as e:
+                if not stop_event.is_set():
+                    print(f"❌ Queue error: {e}")
 
             # Maintain 100 Hz timing
             elapsed = time.time() - loop_start
@@ -509,16 +558,18 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"📊 IMU: 100 samples/sec → uses LATEST GPS + LATEST image")
     print(f"📷 Camera: 10 images/sec → updates image reference")
-    print(f"📍 GPS: ~1 update/sec → updates position data")
+    print(f"🛰️ GPS: ~1 update/sec → updates position data")
+    print(f"📤 Upload: Non-blocking queue → doesn't slow down IMU")
     print(f"")
     print(f"HOW IT WORKS:")
     print(f"  • GPS updates ~every 1 second (background)")
     print(f"  • Camera captures every 0.1 seconds (background)")
-    print(f"  • IMU samples every 0.01 seconds using:")
-    print(f"    - Latest available GPS position")
-    print(f"    - Latest captured image filename")
+    print(f"  • IMU samples EVERY 0.01 seconds (100 Hz) using:")
+    print(f"    - Latest available GPS position (same until GPS updates)")
+    print(f"    - Latest captured image filename (same until camera captures)")
+    print(f"  • Uploads happen in separate thread (no blocking)")
     print(f"")
-    print(f"RESULT: Each IMU sample references the most recent")
+    print(f"RESULT: 100 IMU samples per second, each with most recent")
     print(f"        GPS and image data available at that instant")
     print("-" * 60)
     
