@@ -1,8 +1,7 @@
-import os, csv, time, serial, uuid, subprocess
+import os, csv, time, serial, uuid
 from datetime import datetime
 from threading import Thread, Lock, Event
 from smbus2 import SMBus
-from picamera2 import Picamera2
 from supabase import create_client
 
 # ========= Supabase Config =========
@@ -20,7 +19,7 @@ ACCEL_XOUT_H = 0x3B
 GYRO_XOUT_H = 0x43
 GPS_PORT = "/dev/serial0"
 GPS_BAUD = 9600
-FPS = 5  # Frames per second for camera + IMU
+SAMPLE_RATE = 5  # Samples per second
 
 # ========= Globals =========
 running = False
@@ -36,46 +35,8 @@ latest_gps = {
 
 # Thread references
 gps_thread_obj = None
-cam_imu_thread_obj = None
+imu_thread_obj = None
 stop_event = Event()  # Signal to stop threads
-
-# Camera object global reference
-picam2_global = None
-camera_lock = Lock()
-
-# ========= Camera Reset Function =========
-def reset_camera():
-    """Reset camera by killing any existing processes"""
-    try:
-        print("🔄 Resetting camera processes...")
-        subprocess.run(['sudo', 'killall', '-9', 'libcamera-hello'], 
-                      capture_output=True, stderr=subprocess.DEVNULL)
-        subprocess.run(['sudo', 'killall', '-9', 'libcamera-still'], 
-                      capture_output=True, stderr=subprocess.DEVNULL)
-        subprocess.run(['sudo', 'killall', '-9', 'libcamera-vid'], 
-                      capture_output=True, stderr=subprocess.DEVNULL)
-        subprocess.run(['sudo', 'pkill', '-9', '-f', 'libcamera'], 
-                      capture_output=True, stderr=subprocess.DEVNULL)
-        time.sleep(3)  # Give more time for cleanup
-        print("✅ Camera processes reset complete")
-    except Exception as e:
-        print(f"⚠️  Camera reset error (non-critical): {e}")
-
-def cleanup_camera():
-    """Properly cleanup camera object"""
-    global picam2_global
-    with camera_lock:
-        if picam2_global is not None:
-            try:
-                print("🛑 Stopping camera...")
-                picam2_global.stop()
-                picam2_global.close()
-                time.sleep(1)
-                print("✅ Camera stopped and closed")
-            except Exception as e:
-                print(f"⚠️  Camera cleanup error: {e}")
-            finally:
-                picam2_global = None
 
 # ========= Helpers =========
 def read_word(bus, addr, reg):
@@ -100,7 +61,6 @@ def setup_data_folder():
     
     session_folder = os.path.join(main_data_dir, f"ride{n:02d}")
     os.makedirs(session_folder, exist_ok=True)
-    os.makedirs(os.path.join(session_folder, "images"), exist_ok=True)
     
     return session_folder
 
@@ -127,7 +87,7 @@ def parse_gprmc(line):
 def command_listener():
     """Listen for START/STOP commands from Supabase"""
     global running, current_file_id, rider_id, current_folder
-    global gps_thread_obj, cam_imu_thread_obj, stop_event
+    global gps_thread_obj, imu_thread_obj, stop_event
 
     last_command_id = None
     print("👂 Command listener started - waiting for commands...")
@@ -178,12 +138,12 @@ def command_listener():
                         # START GPS THREAD
                         gps_thread_obj = Thread(target=gps_thread, daemon=False)
                         gps_thread_obj.start()
-                        print("📡  GPS thread STARTED")
+                        print("📡 GPS thread STARTED")
 
-                        # START CAMERA/IMU THREAD
-                        cam_imu_thread_obj = Thread(target=cam_imu_thread, daemon=False)
-                        cam_imu_thread_obj.start()
-                        print("📷 Camera/IMU thread STARTED")
+                        # START IMU THREAD
+                        imu_thread_obj = Thread(target=imu_thread, daemon=False)
+                        imu_thread_obj.start()
+                        print("📊 IMU thread STARTED")
 
                         # Mark command as executed
                         supabase.table("rider_commands")\
@@ -198,7 +158,7 @@ def command_listener():
                         print(f"\n{'='*60}")
                         print(f"🛑 STOP command received!")
                         print(f"👤 Rider ID: {rider_id}")
-                        print(f"⏹️ Stopping threads...")
+                        print(f"⏹️  Stopping threads...")
                         print(f"{'='*60}\n")
                         
                         # Wait for threads to finish
@@ -206,15 +166,9 @@ def command_listener():
                             gps_thread_obj.join(timeout=5)
                             print("✅ GPS thread STOPPED")
                         
-                        if cam_imu_thread_obj and cam_imu_thread_obj.is_alive():
-                            cam_imu_thread_obj.join(timeout=10)
-                            print("✅ Camera/IMU thread STOPPED")
-                        
-                        # Cleanup camera completely
-                        cleanup_camera()
-                        
-                        # Reset camera processes for next ride
-                        reset_camera()
+                        if imu_thread_obj and imu_thread_obj.is_alive():
+                            imu_thread_obj.join(timeout=5)
+                            print("✅ IMU thread STOPPED")
                         
                         print(f"💾 Data saved in: {current_folder}\n")
                         
@@ -227,19 +181,19 @@ def command_listener():
                         current_file_id = None
                         current_folder = None
                         gps_thread_obj = None
-                        cam_imu_thread_obj = None
+                        imu_thread_obj = None
                         
                         print("🔄 System ready for next ride\n")
 
         except Exception as e:
-            print(f"❌  Command listener error: {e}")
+            print(f"❌ Command listener error: {e}")
         
         time.sleep(1)  # Check for commands every second
 
 # ========= GPS Thread =========
 def gps_thread():
     """GPS data collection thread - stops when stop_event is set"""
-    print("📡  GPS collection starting...")
+    print("📡 GPS collection starting...")
     
     try:
         with serial.Serial(GPS_PORT, GPS_BAUD, timeout=1) as ser:
@@ -258,17 +212,12 @@ def gps_thread():
     except Exception as e:
         print(f"GPS serial error: {e}")
     
-    print("📡  GPS thread exiting...")
+    print("📡 GPS thread exiting...")
 
-# ========= Camera + IMU Thread =========
-def cam_imu_thread():
-    """Combined camera and IMU thread - stops when stop_event is set"""
-    global picam2_global
-    
-    print("📷 Camera/IMU initialization starting...")
-
-    # RESET CAMERA BEFORE INITIALIZATION
-    reset_camera()
+# ========= IMU Thread =========
+def imu_thread():
+    """IMU data collection thread - stops when stop_event is set"""
+    print("📊 IMU initialization starting...")
 
     # Setup IMU
     bus = None
@@ -281,41 +230,16 @@ def cam_imu_thread():
         print(f"❌ IMU initialization error: {e}")
         return
 
-    # Setup camera with proper error handling
-    try:
-        with camera_lock:
-            print("📷 Creating Picamera2 instance...")
-            picam2_global = Picamera2()
-            
-            print("📷 Configuring camera...")
-            config = picam2_global.create_video_configuration(
-                main={"size": (1920, 1080), "format": "RGB888"}
-            )
-            picam2_global.configure(config)
-            
-            print("📷 Starting camera...")
-            picam2_global.start()
-            
-        time.sleep(3)  # Give camera more time to fully initialize
-        print("✅ Camera initialized successfully")
-        
-    except Exception as e:
-        print(f"❌ Camera initialization error: {e}")
-        if bus:
-            bus.close()
-        return
-
     csv_file = None
     csv_writer = None
-    img_count = 0
 
     try:
         # Open CSV file
-        csv_path = os.path.join(current_folder, "combined_data.csv")
+        csv_path = os.path.join(current_folder, "sensor_data.csv")
         csv_file = open(csv_path, "w", newline="")
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
-            "timestamp", "epoch_time", "image_filename",
+            "timestamp", "epoch_time",
             "ax_g", "ay_g", "az_g",
             "gx_dps", "gy_dps", "gz_dps",
             "gps_utc", "gps_lat", "gps_ns", "gps_lon", "gps_ew",
@@ -328,20 +252,6 @@ def cam_imu_thread():
             now = datetime.now()
             timestamp_str = now.strftime("%Y-%m-%d_%H-%M-%S-%f")[:-3]
             epoch_time = time.time()
-
-            # Capture image
-            img_count += 1
-            filename = f"image_{timestamp_str}_{img_count:04d}.jpg"
-            filepath = os.path.join(current_folder, "images", filename)
-            
-            try:
-                with camera_lock:
-                    if picam2_global is not None:
-                        picam2_global.capture_file(filepath)
-            except Exception as e:
-                if not stop_event.is_set():
-                    print(f"⚠️  Camera capture error: {e}")
-                filename = "capture_failed.jpg"
 
             # Read IMU data
             ax = read_word(bus, ADDR, ACCEL_XOUT_H)
@@ -365,7 +275,7 @@ def cam_imu_thread():
 
             # Write to CSV backup
             csv_writer.writerow([
-                timestamp_str, epoch_time, f"images/{filename}",
+                timestamp_str, epoch_time,
                 round(ax_g, 4), round(ay_g, 4), round(az_g, 4),
                 round(gx_dps, 3), round(gy_dps, 3), round(gz_dps, 3),
                 gps_copy["utc"], gps_copy["lat"], gps_copy["ns"],
@@ -410,26 +320,24 @@ def cam_imu_thread():
                     "gps_ew": gps_copy["ew"],
                     "gps_speed_kn": speed_val,
                     "gps_course_deg": course_val,
-                    "gps_valid": gps_copy["valid"],
-                    "image_filename": f"images/{filename}"
+                    "gps_valid": gps_copy["valid"]
                 }).execute()
 
                 print(f"✅ [{timestamp_str}] Data pushed to Supabase")
 
             except Exception as e:
                 if not stop_event.is_set():
-                    print(f"❌  Supabase push error: {e}")
+                    print(f"❌ Supabase push error: {e}")
 
             # Console output
-            print(f"📷 Image: {filename}")
-            print(f"   IMU -> ACC: {ax_g:.3f}, {ay_g:.3f}, {az_g:.3f} | "
+            print(f"📊 IMU -> ACC: {ax_g:.3f}, {ay_g:.3f}, {az_g:.3f} | "
                   f"GYRO: {gx_dps:.3f}, {gy_dps:.3f}, {gz_dps:.3f}")
             print(f"   GPS -> Lat:{gps_copy['lat']}{gps_copy['ns']} | "
                   f"Lon:{gps_copy['lon']}{gps_copy['ew']} | Speed:{gps_copy['speed']}kn | Valid:{gps_copy['valid']}")
             print("-" * 100)
 
-            # Control frame rate
-            time.sleep(1.0 / FPS)
+            # Control sample rate
+            time.sleep(1.0 / SAMPLE_RATE)
 
     except Exception as e:
         if not stop_event.is_set():
@@ -444,33 +352,22 @@ def cam_imu_thread():
             print(f"CSV cleanup error: {e}")
         
         try:
-            with camera_lock:
-                if picam2_global is not None:
-                    picam2_global.stop()
-                    print("📷 Camera stopped in thread")
-        except Exception as e:
-            print(f"Camera stop error: {e}")
-        
-        try:
             if bus:
                 bus.close()
                 print("🔌 IMU bus closed")
         except Exception as e:
             print(f"IMU cleanup error: {e}")
     
-    print("📷 Camera/IMU thread exiting...")
+    print("📊 IMU thread exiting...")
 
 # ========= Main =========
 if __name__ == "__main__":
     print("=" * 60)
-    print("   IMU + Camera + GPS Data Logger with Supabase")
+    print("   IMU + GPS Data Logger with Supabase")
     print("=" * 60)
     print(f"☁️  Supabase: Real-time updates enabled")
     print(f"🎧 Listening for commands from ANY rider")
     print("-" * 60)
-    
-    # Initial camera cleanup on startup
-    reset_camera()
     
     try:
         # Only start command listener thread
@@ -478,8 +375,8 @@ if __name__ == "__main__":
         print("🚀 Starting command listener...")
         t_cmd.start()
         
-        print("\n⏳  WAITING FOR START COMMAND FROM WEBSITE...")
-        print("   GPS and Camera threads will start when START is received")
+        print("\n⏳ WAITING FOR START COMMAND FROM WEBSITE...")
+        print("   GPS and IMU threads will start when START is received")
         print("=" * 60)
         
         # Keep main thread alive
@@ -489,11 +386,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n⛔ Received stop signal...")
         stop_event.set()  # Signal all threads to stop
-        cleanup_camera()
-        reset_camera()
         print("👋 Exiting program...")
     except Exception as e:
         print(f"❌ Error: {e}")
     finally:
-        cleanup_camera()
         print("✅ Program ended.")
