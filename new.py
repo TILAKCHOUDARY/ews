@@ -1,6 +1,7 @@
 import os, csv, time, serial, uuid
 from datetime import datetime
 from threading import Thread, Lock, Event
+from queue import Queue
 from smbus2 import SMBus
 from supabase import create_client
 
@@ -33,9 +34,13 @@ latest_gps = {
     "course": "N/A", "date": "N/A", "valid": "N/A"
 }
 
+# Queue for Supabase uploads
+supabase_queue = Queue(maxsize=1000)
+
 # Thread references
 gps_thread_obj = None
 imu_thread_obj = None
+supabase_thread_obj = None
 stop_event = Event()  # Signal to stop threads
 
 # ========= Helpers =========
@@ -83,11 +88,32 @@ def parse_gprmc(line):
         pass
     return None
 
+# ========= Supabase Upload Thread =========
+def supabase_upload_thread():
+    """Dedicated thread for uploading data to Supabase"""
+    print("☁️  Supabase upload thread started...")
+    
+    while not stop_event.is_set() or not supabase_queue.empty():
+        try:
+            # Get data from queue with timeout
+            data = supabase_queue.get(timeout=1)
+            
+            # Upload to Supabase
+            supabase.table("riderdata").insert(data).execute()
+            
+            supabase_queue.task_done()
+            
+        except Exception as e:
+            if not stop_event.is_set():
+                pass  # Silently handle errors to not slow down
+    
+    print("☁️  Supabase upload thread exiting...")
+
 # ========= Command Listener Thread =========
 def command_listener():
     """Listen for START/STOP commands from Supabase"""
     global running, current_file_id, rider_id, current_folder
-    global gps_thread_obj, imu_thread_obj, stop_event
+    global gps_thread_obj, imu_thread_obj, supabase_thread_obj, stop_event
 
     last_command_id = None
     print("👂 Command listener started - waiting for commands...")
@@ -117,6 +143,13 @@ def command_listener():
                         running = True
                         stop_event.clear()  # Reset stop signal
                         
+                        # Clear queue
+                        while not supabase_queue.empty():
+                            try:
+                                supabase_queue.get_nowait()
+                            except:
+                                break
+                        
                         # Create new data folder
                         current_folder = setup_data_folder()
                         
@@ -139,6 +172,11 @@ def command_listener():
                         gps_thread_obj = Thread(target=gps_thread, daemon=False)
                         gps_thread_obj.start()
                         print("📡 GPS thread STARTED")
+
+                        # START SUPABASE UPLOAD THREAD
+                        supabase_thread_obj = Thread(target=supabase_upload_thread, daemon=False)
+                        supabase_thread_obj.start()
+                        print("☁️  Supabase upload thread STARTED")
 
                         # START IMU THREAD (100 Hz)
                         imu_thread_obj = Thread(target=imu_thread, daemon=False)
@@ -170,6 +208,10 @@ def command_listener():
                             imu_thread_obj.join(timeout=5)
                             print("✅ IMU thread STOPPED")
                         
+                        if supabase_thread_obj and supabase_thread_obj.is_alive():
+                            supabase_thread_obj.join(timeout=10)
+                            print("✅ Supabase upload thread STOPPED")
+                        
                         print(f"💾 Data saved in: {current_folder}\n")
                         
                         # Mark command as executed
@@ -182,6 +224,7 @@ def command_listener():
                         current_folder = None
                         gps_thread_obj = None
                         imu_thread_obj = None
+                        supabase_thread_obj = None
                         
                         print("🔄 System ready for next ride\n")
 
@@ -232,6 +275,7 @@ def imu_thread():
 
     csv_file = None
     csv_writer = None
+    sample_count = 0
 
     try:
         # Open CSV file
@@ -248,49 +292,54 @@ def imu_thread():
         print(f"📝 CSV file created: {csv_path}")
 
         sample_interval = 1.0 / IMU_SAMPLE_RATE  # 0.01 seconds = 10ms
+        next_sample_time = time.time()
         
         while not stop_event.is_set():
-            loop_start = time.time()
+            current_time = time.time()
             
-            # Get synchronized timestamp
-            now = datetime.now()
-            timestamp_str = now.strftime("%Y-%m-%d_%H-%M-%S-%f")[:-3]
-            epoch_time = time.time()
+            # Only sample if it's time
+            if current_time >= next_sample_time:
+                # Get synchronized timestamp
+                now = datetime.now()
+                timestamp_str = now.strftime("%Y-%m-%d_%H-%M-%S-%f")[:-3]
+                epoch_time = current_time
 
-            # Read IMU data
-            ax = read_word(bus, ADDR, ACCEL_XOUT_H)
-            ay = read_word(bus, ADDR, ACCEL_XOUT_H+2)
-            az = read_word(bus, ADDR, ACCEL_XOUT_H+4)
-            gx = read_word(bus, ADDR, GYRO_XOUT_H)
-            gy = read_word(bus, ADDR, GYRO_XOUT_H+2)
-            gz = read_word(bus, ADDR, GYRO_XOUT_H+4)
+                # Read IMU data
+                ax = read_word(bus, ADDR, ACCEL_XOUT_H)
+                ay = read_word(bus, ADDR, ACCEL_XOUT_H+2)
+                az = read_word(bus, ADDR, ACCEL_XOUT_H+4)
+                gx = read_word(bus, ADDR, GYRO_XOUT_H)
+                gy = read_word(bus, ADDR, GYRO_XOUT_H+2)
+                gz = read_word(bus, ADDR, GYRO_XOUT_H+4)
 
-            # Convert to physical units
-            ax_g = ax / 16384.0
-            ay_g = ay / 16384.0
-            az_g = az / 16384.0
-            gx_dps = gx / 131.0
-            gy_dps = gy / 131.0
-            gz_dps = gz / 131.0
+                # Convert to physical units
+                ax_g = ax / 16384.0
+                ay_g = ay / 16384.0
+                az_g = az / 16384.0
+                gx_dps = gx / 131.0
+                gy_dps = gy / 131.0
+                gz_dps = gz / 131.0
 
-            # Get latest GPS data safely
-            with gps_lock:
-                gps_copy = latest_gps.copy()
+                # Get latest GPS data safely
+                with gps_lock:
+                    gps_copy = latest_gps.copy()
 
-            # Write to CSV backup
-            csv_writer.writerow([
-                timestamp_str, epoch_time,
-                round(ax_g, 4), round(ay_g, 4), round(az_g, 4),
-                round(gx_dps, 3), round(gy_dps, 3), round(gz_dps, 3),
-                gps_copy["utc"], gps_copy["lat"], gps_copy["ns"],
-                gps_copy["lon"], gps_copy["ew"],
-                gps_copy["speed"], gps_copy["course"], gps_copy["valid"]
-            ])
-            csv_file.flush()
+                # Write to CSV backup
+                csv_writer.writerow([
+                    timestamp_str, epoch_time,
+                    round(ax_g, 4), round(ay_g, 4), round(az_g, 4),
+                    round(gx_dps, 3), round(gy_dps, 3), round(gz_dps, 3),
+                    gps_copy["utc"], gps_copy["lat"], gps_copy["ns"],
+                    gps_copy["lon"], gps_copy["ew"],
+                    gps_copy["speed"], gps_copy["course"], gps_copy["valid"]
+                ])
+                
+                # Flush every 100 samples
+                sample_count += 1
+                if sample_count % 100 == 0:
+                    csv_file.flush()
 
-            # ========= PUSH TO SUPABASE IN REAL-TIME =========
-            try:
-                # Convert GPS speed and course to float
+                # Prepare Supabase data
                 speed_val = None
                 course_val = None
                 
@@ -306,44 +355,44 @@ def imu_thread():
                     except:
                         pass
 
-                # Insert sensor reading to Supabase
-                supabase.table("riderdata").insert({
-                    "rider_id": rider_id,
-                    "file_id": current_file_id,
-                    "timestamp": now.isoformat(),
-                    "ax": round(ax_g, 4),
-                    "ay": round(ay_g, 4),
-                    "az": round(az_g, 4),
-                    "gx": round(gx_dps, 3),
-                    "gy": round(gy_dps, 3),
-                    "gz": round(gz_dps, 3),
-                    "gps_utc": gps_copy["utc"],
-                    "gps_lat": gps_copy["lat"],
-                    "gps_ns": gps_copy["ns"],
-                    "gps_lon": gps_copy["lon"],
-                    "gps_ew": gps_copy["ew"],
-                    "gps_speed_kn": speed_val,
-                    "gps_course_deg": course_val,
-                    "gps_valid": gps_copy["valid"]
-                }).execute()
+                # Add to upload queue (non-blocking)
+                try:
+                    supabase_queue.put_nowait({
+                        "rider_id": rider_id,
+                        "file_id": current_file_id,
+                        "timestamp": now.isoformat(),
+                        "ax": round(ax_g, 4),
+                        "ay": round(ay_g, 4),
+                        "az": round(az_g, 4),
+                        "gx": round(gx_dps, 3),
+                        "gy": round(gy_dps, 3),
+                        "gz": round(gz_dps, 3),
+                        "gps_utc": gps_copy["utc"],
+                        "gps_lat": gps_copy["lat"],
+                        "gps_ns": gps_copy["ns"],
+                        "gps_lon": gps_copy["lon"],
+                        "gps_ew": gps_copy["ew"],
+                        "gps_speed_kn": speed_val,
+                        "gps_course_deg": course_val,
+                        "gps_valid": gps_copy["valid"]
+                    })
+                except:
+                    pass  # Queue full, skip this sample
 
-                # Console output
-                print(f"✅ [{timestamp_str}] Data pushed to Supabase")
-                print(f"📊 IMU -> ACC: {ax_g:.3f}, {ay_g:.3f}, {az_g:.3f} | "
-                      f"GYRO: {gx_dps:.3f}, {gy_dps:.3f}, {gz_dps:.3f}")
-                print(f"   GPS -> Lat:{gps_copy['lat']}{gps_copy['ns']} | "
-                      f"Lon:{gps_copy['lon']}{gps_copy['ew']} | Speed:{gps_copy['speed']}kn | Valid:{gps_copy['valid']}")
-                print("-" * 100)
+                # Console output (every 10th sample to avoid flooding)
+                if sample_count % 10 == 0:
+                    print(f"✅ [{timestamp_str}] Data pushed to Supabase")
+                    print(f"📊 IMU -> ACC: {ax_g:.3f}, {ay_g:.3f}, {az_g:.3f} | "
+                          f"GYRO: {gx_dps:.3f}, {gy_dps:.3f}, {gz_dps:.3f}")
+                    print(f"   GPS -> Lat:{gps_copy['lat']}{gps_copy['ns']} | "
+                          f"Lon:{gps_copy['lon']}{gps_copy['ew']} | Speed:{gps_copy['speed']}kn | Valid:{gps_copy['valid']}")
+                    print("-" * 100)
 
-            except Exception as e:
-                if not stop_event.is_set():
-                    print(f"❌ Supabase push error: {e}")
-
-            # Precise timing control for 100 Hz
-            elapsed = time.time() - loop_start
-            sleep_time = sample_interval - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+                # Calculate next sample time
+                next_sample_time += sample_interval
+            else:
+                # Sleep for a very short time to avoid busy waiting
+                time.sleep(0.0001)
 
     except Exception as e:
         if not stop_event.is_set():
