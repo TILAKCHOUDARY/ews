@@ -6,8 +6,15 @@ from smbus2 import SMBus
 from supabase import create_client
 import cv2
 import numpy as np
-from picamera2 import Picamera2
-import json
+
+# Try to import picamera2 (optional)
+try:
+    from picamera2 import Picamera2
+    PICAMERA2_AVAILABLE = True
+except Exception as e:
+    print(f"⚠️  Warning: Picamera2 not available: {e}")
+    print("⚠️  Pothole detection will be DISABLED")
+    PICAMERA2_AVAILABLE = False
 
 # ========= Supabase Config =========
 SUPABASE_URL = "https://ghtqafnlnijxvsmzdnmh.supabase.co"
@@ -30,7 +37,7 @@ IMU_SAMPLE_RATE = 100  # 100 samples per second for IMU
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
-POTHOLE_DETECTION_ENABLED = True
+POTHOLE_DETECTION_ENABLED = PICAMERA2_AVAILABLE  # Auto-disable if camera not available
 
 # ========= Globals =========
 running = False
@@ -78,7 +85,7 @@ def setup_data_folder():
     session_folder = os.path.join(main_data_dir, f"ride{n:02d}")
     os.makedirs(session_folder, exist_ok=True)
     
-    # Create subdirectory for pothole images
+    # Create subdirectory for pothole images (even if camera disabled)
     pothole_images_dir = os.path.join(session_folder, "pothole_images")
     os.makedirs(pothole_images_dir, exist_ok=True)
     
@@ -150,6 +157,10 @@ def detect_pothole(frame):
 # ========= Pothole Detection Thread =========
 def pothole_detection_thread():
     """Camera-based pothole detection thread"""
+    if not PICAMERA2_AVAILABLE:
+        print("📷 Pothole detection SKIPPED - Picamera2 not available")
+        return
+    
     print("📷 Pothole detection starting...")
     
     picam2 = None
@@ -371,6 +382,8 @@ def command_listener():
                             pothole_thread_obj = Thread(target=pothole_detection_thread, daemon=False)
                             pothole_thread_obj.start()
                             print("📷 Pothole detection thread STARTED")
+                        else:
+                            print("⚠️  Pothole detection DISABLED (camera not available)")
 
                         # Mark command as executed
                         supabase.table("rider_commands")\
