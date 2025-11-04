@@ -4,6 +4,10 @@ from threading import Thread, Lock, Event
 from queue import Queue
 from smbus2 import SMBus
 from supabase import create_client
+import cv2
+import numpy as np
+from picamera2 import Picamera2
+import json
 
 # ========= Supabase Config =========
 SUPABASE_URL = "https://ghtqafnlnijxvsmzdnmh.supabase.co"
@@ -21,6 +25,12 @@ GYRO_XOUT_H = 0x43
 GPS_PORT = "/dev/serial0"
 GPS_BAUD = 9600
 IMU_SAMPLE_RATE = 100  # 100 samples per second for IMU
+
+# ========= Pothole Detection Config =========
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+CAMERA_FPS = 30
+POTHOLE_DETECTION_ENABLED = True
 
 # ========= Globals =========
 running = False
@@ -41,6 +51,7 @@ supabase_queue = Queue(maxsize=1000)
 gps_thread_obj = None
 imu_thread_obj = None
 supabase_thread_obj = None
+pothole_thread_obj = None
 stop_event = Event()  # Signal to stop threads
 
 # ========= Helpers =========
@@ -67,6 +78,10 @@ def setup_data_folder():
     session_folder = os.path.join(main_data_dir, f"ride{n:02d}")
     os.makedirs(session_folder, exist_ok=True)
     
+    # Create subdirectory for pothole images
+    pothole_images_dir = os.path.join(session_folder, "pothole_images")
+    os.makedirs(pothole_images_dir, exist_ok=True)
+    
     return session_folder
 
 def parse_gprmc(line):
@@ -88,10 +103,178 @@ def parse_gprmc(line):
         pass
     return None
 
+# ========= Pothole Detection Functions =========
+def detect_pothole(frame):
+    """
+    Simple pothole detection using edge detection and contour analysis
+    Returns: (is_pothole, confidence, contour_area)
+    """
+    try:
+        # Convert to grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Apply Gaussian blur
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Edge detection
+        edges = cv2.Canny(blurred, 50, 150)
+        
+        # Find contours
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Filter contours by area
+        pothole_contours = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            # Pothole typically has area between 500 and 50000 pixels
+            if 500 < area < 50000:
+                # Check if contour is roughly circular/elliptical
+                perimeter = cv2.arcLength(contour, True)
+                if perimeter > 0:
+                    circularity = 4 * np.pi * area / (perimeter * perimeter)
+                    if circularity > 0.3:  # Somewhat circular
+                        pothole_contours.append((contour, area))
+        
+        if pothole_contours:
+            # Get largest pothole
+            largest_contour, largest_area = max(pothole_contours, key=lambda x: x[1])
+            confidence = min(largest_area / 10000.0, 1.0)  # Normalize confidence
+            return True, confidence, largest_area, largest_contour
+        
+        return False, 0.0, 0, None
+        
+    except Exception as e:
+        print(f"Pothole detection error: {e}")
+        return False, 0.0, 0, None
+
+# ========= Pothole Detection Thread =========
+def pothole_detection_thread():
+    """Camera-based pothole detection thread"""
+    print("📷 Pothole detection starting...")
+    
+    picam2 = None
+    csv_file = None
+    csv_writer = None
+    detection_count = 0
+    
+    try:
+        # Initialize camera
+        picam2 = Picamera2()
+        config = picam2.create_preview_configuration(
+            main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"}
+        )
+        picam2.configure(config)
+        picam2.start()
+        time.sleep(2)  # Camera warm-up
+        print("✅ Camera initialized successfully")
+        
+        # Open CSV file for pothole detections
+        csv_path = os.path.join(current_folder, "pothole_detections.csv")
+        csv_file = open(csv_path, "w", newline="")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow([
+            "timestamp", "epoch_time", "is_pothole", "confidence", 
+            "area_pixels", "image_filename",
+            "gps_lat", "gps_lon", "gps_valid"
+        ])
+        print(f"📝 Pothole CSV created: {csv_path}")
+        
+        frame_interval = 1.0 / CAMERA_FPS  # Time between frames
+        last_detection_time = 0
+        min_detection_interval = 2.0  # Minimum 2 seconds between detections
+        
+        while not stop_event.is_set():
+            try:
+                # Capture frame
+                frame = picam2.capture_array()
+                current_time = time.time()
+                
+                # Detect pothole
+                is_pothole, confidence, area, contour = detect_pothole(frame)
+                
+                if is_pothole and (current_time - last_detection_time) > min_detection_interval:
+                    detection_count += 1
+                    last_detection_time = current_time
+                    
+                    now = datetime.now()
+                    timestamp_str = now.strftime("%Y-%m-%d_%H-%M-%S-%f")[:-3]
+                    
+                    # Save image with detection
+                    image_filename = f"pothole_{detection_count:04d}_{timestamp_str}.jpg"
+                    image_path = os.path.join(current_folder, "pothole_images", image_filename)
+                    
+                    # Draw contour on frame
+                    if contour is not None:
+                        cv2.drawContours(frame, [contour], -1, (0, 255, 0), 2)
+                        # Add text
+                        cv2.putText(frame, f"POTHOLE! Conf: {confidence:.2f}", 
+                                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                                   1, (0, 0, 255), 2)
+                    
+                    cv2.imwrite(image_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                    
+                    # Get GPS data
+                    with gps_lock:
+                        gps_copy = latest_gps.copy()
+                    
+                    # Write to CSV
+                    csv_writer.writerow([
+                        timestamp_str, current_time, 1, round(confidence, 3),
+                        int(area), image_filename,
+                        gps_copy["lat"], gps_copy["lon"], gps_copy["valid"]
+                    ])
+                    csv_file.flush()
+                    
+                    # Upload to Supabase
+                    try:
+                        supabase.table("pothole_detections").insert({
+                            "rider_id": rider_id,
+                            "file_id": current_file_id,
+                            "timestamp": now.isoformat(),
+                            "confidence": round(confidence, 3),
+                            "area_pixels": int(area),
+                            "image_filename": image_filename,
+                            "gps_lat": gps_copy["lat"],
+                            "gps_lon": gps_copy["lon"],
+                            "gps_valid": gps_copy["valid"]
+                        }).execute()
+                    except Exception as e:
+                        print(f"Pothole Supabase upload error: {e}")
+                    
+                    print(f"🚨 POTHOLE DETECTED! #{detection_count}")
+                    print(f"   Confidence: {confidence:.2f} | Area: {area}px")
+                    print(f"   Image saved: {image_filename}")
+                    print(f"   GPS: {gps_copy['lat']}{gps_copy['ns']}, {gps_copy['lon']}{gps_copy['ew']}")
+                    print("-" * 100)
+                
+                # Control frame rate
+                time.sleep(frame_interval)
+                
+            except Exception as e:
+                if not stop_event.is_set():
+                    print(f"Frame processing error: {e}")
+                time.sleep(0.1)
+    
+    except Exception as e:
+        print(f"❌ Camera initialization error: {e}")
+    
+    finally:
+        # Cleanup
+        if csv_file:
+            csv_file.close()
+            print("💾 Pothole CSV closed")
+        
+        if picam2:
+            picam2.stop()
+            picam2.close()
+            print("📷 Camera closed")
+    
+    print("📷 Pothole detection thread exiting...")
+
 # ========= Supabase Upload Thread =========
 def supabase_upload_thread():
     """Dedicated thread for uploading data to Supabase"""
-    print("☁️  Supabase upload thread started...")
+    print("☁  Supabase upload thread started...")
     
     while not stop_event.is_set() or not supabase_queue.empty():
         try:
@@ -107,13 +290,13 @@ def supabase_upload_thread():
             if not stop_event.is_set():
                 pass  # Silently handle errors to not slow down
     
-    print("☁️  Supabase upload thread exiting...")
+    print("☁  Supabase upload thread exiting...")
 
 # ========= Command Listener Thread =========
 def command_listener():
     """Listen for START/STOP commands from Supabase"""
     global running, current_file_id, rider_id, current_folder
-    global gps_thread_obj, imu_thread_obj, supabase_thread_obj, stop_event
+    global gps_thread_obj, imu_thread_obj, supabase_thread_obj, pothole_thread_obj, stop_event
 
     last_command_id = None
     print("👂 Command listener started - waiting for commands...")
@@ -176,12 +359,18 @@ def command_listener():
                         # START SUPABASE UPLOAD THREAD
                         supabase_thread_obj = Thread(target=supabase_upload_thread, daemon=False)
                         supabase_thread_obj.start()
-                        print("☁️  Supabase upload thread STARTED")
+                        print("☁  Supabase upload thread STARTED")
 
                         # START IMU THREAD (100 Hz)
                         imu_thread_obj = Thread(target=imu_thread, daemon=False)
                         imu_thread_obj.start()
                         print("📊 IMU thread STARTED (100 Hz)")
+
+                        # START POTHOLE DETECTION THREAD
+                        if POTHOLE_DETECTION_ENABLED:
+                            pothole_thread_obj = Thread(target=pothole_detection_thread, daemon=False)
+                            pothole_thread_obj.start()
+                            print("📷 Pothole detection thread STARTED")
 
                         # Mark command as executed
                         supabase.table("rider_commands")\
@@ -196,7 +385,7 @@ def command_listener():
                         print(f"\n{'='*60}")
                         print(f"🛑 STOP command received!")
                         print(f"👤 Rider ID: {rider_id}")
-                        print(f"⏹️  Stopping threads...")
+                        print(f"⏹  Stopping threads...")
                         print(f"{'='*60}\n")
                         
                         # Wait for threads to finish
@@ -207,6 +396,10 @@ def command_listener():
                         if imu_thread_obj and imu_thread_obj.is_alive():
                             imu_thread_obj.join(timeout=5)
                             print("✅ IMU thread STOPPED")
+                        
+                        if pothole_thread_obj and pothole_thread_obj.is_alive():
+                            pothole_thread_obj.join(timeout=5)
+                            print("✅ Pothole detection thread STOPPED")
                         
                         if supabase_thread_obj and supabase_thread_obj.is_alive():
                             supabase_thread_obj.join(timeout=10)
@@ -225,6 +418,7 @@ def command_listener():
                         gps_thread_obj = None
                         imu_thread_obj = None
                         supabase_thread_obj = None
+                        pothole_thread_obj = None
                         
                         print("🔄 System ready for next ride\n")
 
@@ -418,10 +612,11 @@ def imu_thread():
 # ========= Main =========
 if __name__ == "__main__":
     print("=" * 60)
-    print("   IMU (100 Hz) + GPS Data Logger with Supabase")
+    print("   IMU (100 Hz) + GPS + POTHOLE Detection Logger")
     print("=" * 60)
-    print(f"☁️  Supabase: Real-time updates enabled")
+    print(f"☁  Supabase: Real-time updates enabled")
     print(f"📊 IMU Sampling Rate: {IMU_SAMPLE_RATE} Hz")
+    print(f"📷 Pothole Detection: {'ENABLED' if POTHOLE_DETECTION_ENABLED else 'DISABLED'}")
     print(f"🎧 Listening for commands from ANY rider")
     print("-" * 60)
     
@@ -432,7 +627,7 @@ if __name__ == "__main__":
         t_cmd.start()
         
         print("\n⏳ WAITING FOR START COMMAND FROM WEBSITE...")
-        print("   GPS and IMU threads will start when START is received")
+        print("   GPS, IMU, and Pothole Detection threads will start when START is received")
         print("=" * 60)
         
         # Keep main thread alive
