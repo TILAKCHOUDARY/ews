@@ -19,7 +19,7 @@ ACCEL_XOUT_H = 0x3B
 GYRO_XOUT_H = 0x43
 GPS_PORT = "/dev/serial0"
 GPS_BAUD = 9600
-SAMPLE_RATE = 5  # Samples per second
+IMU_SAMPLE_RATE = 100  # 100 samples per second for IMU
 
 # ========= Globals =========
 running = False
@@ -140,10 +140,10 @@ def command_listener():
                         gps_thread_obj.start()
                         print("📡 GPS thread STARTED")
 
-                        # START IMU THREAD
+                        # START IMU THREAD (100 Hz)
                         imu_thread_obj = Thread(target=imu_thread, daemon=False)
                         imu_thread_obj.start()
-                        print("📊 IMU thread STARTED")
+                        print("📊 IMU thread STARTED (100 Hz)")
 
                         # Mark command as executed
                         supabase.table("rider_commands")\
@@ -216,7 +216,7 @@ def gps_thread():
 
 # ========= IMU Thread =========
 def imu_thread():
-    """IMU data collection thread - stops when stop_event is set"""
+    """IMU data collection thread - 100 Hz sampling - stops when stop_event is set"""
     print("📊 IMU initialization starting...")
 
     # Setup IMU
@@ -225,7 +225,7 @@ def imu_thread():
         bus = SMBus(BUS_NUM)
         bus.write_byte_data(ADDR, PWR_MGMT_1, 0)
         time.sleep(0.1)
-        print("✅ IMU initialized successfully")
+        print("✅ IMU initialized successfully (100 Hz sampling)")
     except Exception as e:
         print(f"❌ IMU initialization error: {e}")
         return
@@ -247,7 +247,11 @@ def imu_thread():
         ])
         print(f"📝 CSV file created: {csv_path}")
 
+        sample_interval = 1.0 / IMU_SAMPLE_RATE  # 0.01 seconds = 10ms
+        
         while not stop_event.is_set():
+            loop_start = time.time()
+            
             # Get synchronized timestamp
             now = datetime.now()
             timestamp_str = now.strftime("%Y-%m-%d_%H-%M-%S-%f")[:-3]
@@ -323,21 +327,23 @@ def imu_thread():
                     "gps_valid": gps_copy["valid"]
                 }).execute()
 
+                # Console output
                 print(f"✅ [{timestamp_str}] Data pushed to Supabase")
+                print(f"📊 IMU -> ACC: {ax_g:.3f}, {ay_g:.3f}, {az_g:.3f} | "
+                      f"GYRO: {gx_dps:.3f}, {gy_dps:.3f}, {gz_dps:.3f}")
+                print(f"   GPS -> Lat:{gps_copy['lat']}{gps_copy['ns']} | "
+                      f"Lon:{gps_copy['lon']}{gps_copy['ew']} | Speed:{gps_copy['speed']}kn | Valid:{gps_copy['valid']}")
+                print("-" * 100)
 
             except Exception as e:
                 if not stop_event.is_set():
                     print(f"❌ Supabase push error: {e}")
 
-            # Console output
-            print(f"📊 IMU -> ACC: {ax_g:.3f}, {ay_g:.3f}, {az_g:.3f} | "
-                  f"GYRO: {gx_dps:.3f}, {gy_dps:.3f}, {gz_dps:.3f}")
-            print(f"   GPS -> Lat:{gps_copy['lat']}{gps_copy['ns']} | "
-                  f"Lon:{gps_copy['lon']}{gps_copy['ew']} | Speed:{gps_copy['speed']}kn | Valid:{gps_copy['valid']}")
-            print("-" * 100)
-
-            # Control sample rate
-            time.sleep(1.0 / SAMPLE_RATE)
+            # Precise timing control for 100 Hz
+            elapsed = time.time() - loop_start
+            sleep_time = sample_interval - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
     except Exception as e:
         if not stop_event.is_set():
@@ -363,9 +369,10 @@ def imu_thread():
 # ========= Main =========
 if __name__ == "__main__":
     print("=" * 60)
-    print("   IMU + GPS Data Logger with Supabase")
+    print("   IMU (100 Hz) + GPS Data Logger with Supabase")
     print("=" * 60)
     print(f"☁️  Supabase: Real-time updates enabled")
+    print(f"📊 IMU Sampling Rate: {IMU_SAMPLE_RATE} Hz")
     print(f"🎧 Listening for commands from ANY rider")
     print("-" * 60)
     
