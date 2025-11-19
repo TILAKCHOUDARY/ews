@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os, csv, time, serial, uuid
 from datetime import datetime
 from threading import Thread, Lock, Event
@@ -10,19 +11,22 @@ from collections import deque
 import torch
 import torch.nn as nn
 import numpy as np
-from sklearn.preprocessing import StandardScaler
-import joblib
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 
 # Pothole detection imports
 from torchvision import models, transforms
 from PIL import Image
 import cv2
-from picamera2 import Picamera2
+# Picamera2 import will fail on non-RPi environments; keep it guarded at runtime
+try:
+    from picamera2 import Picamera2
+    PICAMERA2_AVAILABLE = True
+except Exception:
+    PICAMERA2_AVAILABLE = False
 
 # ========= Supabase Config =========
 SUPABASE_URL = "https://ghtqafnlnijxvsmzdnmh.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdodHFhZm5sbmlqeHZzbXpkbm1oIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk3NDQyNjcsImV4cCI6MjA3NTMyMDI2N30.Q1LGQP8JQdWn6rJJ1XRYT8rfo9b2Q5YfWUytrzQEsa0"
-
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ========= Hardware Config =========
@@ -36,7 +40,14 @@ GPS_BAUD = 9600
 IMU_SAMPLE_RATE = 104
 
 # ========= Event Detection Config =========
-EVENT_MODEL_PATH = "imu_classifier_model.pth"
+# prefer imu_classifier_model.pth if present, else fall back to event_lstm_model.pth
+if os.path.exists("imu_classifier_model.pth"):
+    EVENT_MODEL_PATH = "imu_classifier_model.pth"
+elif os.path.exists("event_lstm_model.pth"):
+    EVENT_MODEL_PATH = "event_lstm_model.pth"
+else:
+    EVENT_MODEL_PATH = "imu_classifier_model.pth"  # default path the rest of code references
+
 EVENT_CLASSES = ['STRAIGHT', 'BUMP', 'LEFT', 'RIGHT', 'STOP']
 WINDOW_SIZE = 50  # Collect 50 samples before prediction
 MIN_EVENT_DURATION = 0.5  # Minimum 0.5 seconds for event to be logged
@@ -188,28 +199,87 @@ def parse_gprmc(line):
 def load_event_model():
     global event_model, event_scaler, label_encoder
     
+    if not os.path.exists(EVENT_MODEL_PATH):
+        print(f"❌ Event model file not found at {EVENT_MODEL_PATH}")
+        return False
+
     try:
         print("🧠 Loading event detection model...")
-        checkpoint = torch.load(EVENT_MODEL_PATH, map_location='cpu')
-        
-        # Load scaler and label encoder
-        event_scaler = checkpoint['scaler']
-        label_encoder = checkpoint['label_encoder']
-        
-        # Create model architecture
-        num_classes = len(label_encoder.classes_)
+
+        # Try safe load first (PyTorch 2.6 default may require weights_only=False)
+        try:
+            checkpoint = torch.load(EVENT_MODEL_PATH, map_location='cpu')
+        except Exception as e_outer:
+            # Try with weights_only=False and allowlist sklearn classes if needed (only if file is trusted)
+            try:
+                from sklearn.preprocessing import StandardScaler as _Std, LabelEncoder as _Lab
+                torch.serialization.add_safe_globals([_Std, _Lab])
+                checkpoint = torch.load(EVENT_MODEL_PATH, map_location='cpu', weights_only=False)
+            except Exception as e_inner:
+                print(f"❌ Secondary load attempt failed: {e_inner}")
+                raise e_inner
+
+        # --------- Reconstruct scaler ----------
+        if 'scaler' in checkpoint and isinstance(checkpoint['scaler'], (StandardScaler,)):
+            event_scaler = checkpoint['scaler']
+        elif 'scaler_mean' in checkpoint and 'scaler_scale' in checkpoint:
+            sc = StandardScaler()
+            sc.mean_ = np.array(checkpoint['scaler_mean'])
+            sc.scale_ = np.array(checkpoint['scaler_scale'])
+            # set var_ if available
+            if 'scaler_var' in checkpoint:
+                sc.var_ = np.array(checkpoint['scaler_var'])
+            event_scaler = sc
+        else:
+            # fallback: create a dummy scaler that does identity transform (beware: model expects scaled input)
+            print("⚠ scaler not found in checkpoint. Creating identity scaler (not recommended).")
+            sc = StandardScaler()
+            sc.mean_ = np.zeros(7)
+            sc.scale_ = np.ones(7)
+            event_scaler = sc
+
+        # --------- Reconstruct label encoder ----------
+        if 'label_encoder' in checkpoint and hasattr(checkpoint['label_encoder'], 'classes_'):
+            label_encoder = checkpoint['label_encoder']
+        elif 'classes' in checkpoint:
+            le = LabelEncoder()
+            le.classes_ = np.array(checkpoint['classes'])
+            label_encoder = le
+        else:
+            # fallback: use EVENT_CLASSES
+            le = LabelEncoder()
+            le.fit(EVENT_CLASSES)
+            label_encoder = le
+            print("⚠ label encoder not found in checkpoint. Using default EVENT_CLASSES.")
+
+        # --------- Build model architecture and load weights ----------
+        num_classes = len(getattr(label_encoder, "classes_", EVENT_CLASSES))
         event_model = IMUClassifier(input_size=7, num_classes=num_classes)
-        event_model.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint.get('model_state_dict', None)
+        if state_dict is None:
+            print("❌ No 'model_state_dict' in checkpoint.")
+            return False
+
+        try:
+            event_model.load_state_dict(state_dict)
+        except Exception as e:
+            # try non-strict load if sizes differ slightly
+            try:
+                event_model.load_state_dict(state_dict, strict=False)
+                print("⚠ model loaded with strict=False (shape mismatch tolerated).")
+            except Exception as final_e:
+                print(f"❌ Failed to load model_state_dict: {final_e}")
+                return False
+
         event_model.eval()
-        
+
         print(f"✅ Event model loaded successfully!")
         print(f"   Classes: {list(label_encoder.classes_)}")
         print(f"   Test accuracy: {checkpoint.get('test_accuracy', 'N/A')}")
         return True
-        
+
     except Exception as e:
         print(f"❌ Failed to load event model: {e}")
-        print(f"   Make sure '{EVENT_MODEL_PATH}' exists in the same directory")
         return False
 
 # ========= Supabase Upload Thread =========
@@ -220,7 +290,7 @@ def supabase_upload_thread():
             data = supabase_queue.get(timeout=1)
             try:
                 supabase.table("riderdata").insert(data).execute()
-            except Exception as e:
+            except Exception:
                 pass
             supabase_queue.task_done()
         except Exception:
@@ -404,7 +474,7 @@ def event_detection_thread():
     
     print("🧠 Event detection thread starting...")
     
-    if event_model is None or event_scaler is None:
+    if event_model is None or event_scaler is None or label_encoder is None:
         print("❌ Event model not loaded. Cannot start event detection.")
         return
     
@@ -433,7 +503,7 @@ def event_detection_thread():
                     latest['gx'],
                     latest['gy'],
                     latest['gz']
-                ]])
+                ]], dtype=float)
                 
                 # Scale and predict
                 features_scaled = event_scaler.transform(features)
@@ -528,7 +598,7 @@ def event_detection_thread():
                             current_event_start_str = None
                             current_event_confidences = []
                 
-            except Exception as e:
+            except Exception:
                 if not stop_event.is_set():
                     time.sleep(0.01)
     
@@ -576,14 +646,22 @@ def pothole_thread():
         model_pothole = models.resnet18()
         num_features = model_pothole.fc.in_features
         model_pothole.fc = torch.nn.Linear(num_features, 2)
-        model_pothole.load_state_dict(torch.load(POTHOLE_MODEL_PATH, map_location='cpu'))
-        model_pothole.eval()
-        print("✅ Pothole model loaded")
+        if os.path.exists(POTHOLE_MODEL_PATH):
+            model_pothole.load_state_dict(torch.load(POTHOLE_MODEL_PATH, map_location='cpu'))
+            model_pothole.eval()
+            print("✅ Pothole model loaded")
+        else:
+            print(f"⚠ Pothole model not found: {POTHOLE_MODEL_PATH}. Pothole detection disabled.")
+            return
     except Exception as e:
         print(f"❌ Failed to load pothole model: {e}")
         return
 
     # Start camera
+    if not PICAMERA2_AVAILABLE:
+        print("⚠ Picamera2 not available on this machine; pothole camera disabled.")
+        return
+
     try:
         picam2 = Picamera2()
         config = picam2.create_preview_configuration(
@@ -890,7 +968,7 @@ if __name__ == "__main__":
     # Load event detection model
     if not load_event_model():
         print("\n❌ CRITICAL: Event model failed to load!")
-        print("   Please ensure 'imu_classifier_model.pth' exists in the same directory.")
+        print("   Please ensure a compatible checkpoint exists in the same directory (imu_classifier_model.pth or event_lstm_model.pth).")
         print("   The system will continue but event detection will NOT work.")
         print("\n   To train the model, run the training notebook first.")
     
